@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: o2-anomaly-detector
+  namespace: kafka
+  labels:
+    app: o2-anomaly-detector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: o2-anomaly-detector
+  template:
+    metadata:
+      labels:
+        app: o2-anomaly-detector
+    spec:
+      containers:
+        - name: anomaly-detector
+          image: REPLACE_WITH_ECR_URL:v2-glibc
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: health
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "o2-kafka-kafka-bootstrap:9092"
+            - name: APPLICATION_ID
+              value: "o2-anomaly-detector"
+            - name: DYNAMODB_TABLE
+              value: "o2-platform-feature-store"
+            - name: DYNAMODB_REGION
+              value: "us-east-1"
+            - name: INPUT_TOPICS
+              value: "transactions,claims,logins,transfers"
+            - name: OUTPUT_TOPIC
+              value: "anomalies"
+            - name: DYNAMODB_SCORES_TABLE
+              value: "o2-platform-anomaly-scores"
+            - name: SNS_TOPIC_ARN
+              value: "REPLACE_WITH_SNS_ARN"
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 500m
+            limits:
+              memory: 1Gi
+              cpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 15
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: o2-anomaly-detector
+  namespace: kafka
+spec:
+  selector:
+    app: o2-anomaly-detector
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: health
+  type: ClusterIP

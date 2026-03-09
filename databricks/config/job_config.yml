@@ -1,0 +1,46 @@
+# =============================================================================
+# O2 Platform — Databricks Job Configuration
+# PRD §6.2 — Used by Jenkins Blue-Green pipeline
+# =============================================================================
+
+model:
+  name: o2-anomaly-xgboost
+  experiment: /O2-Anomaly-Detection
+
+scoring_job:
+  name_prefix: o2-scoring
+  spark_version: "14.3.x-scala2.12"
+  num_workers: 0  # Single-node (Community Edition constraint)
+  node_type_id: i3.xlarge
+
+  # Wheel location in S3 (populated by Jenkins at build time)
+  wheel_path: "s3://${ARTIFACTS_BUCKET}/models/${MODEL_NAME}/${VERSION}/o2_anomaly_model-1.0.0-py3-none-any.whl"
+
+  entry_point: score
+  package_name: o2_anomaly_model
+
+validation:
+  # PRD §5.3 — Metric thresholds for Blue-Green switch
+  min_auc: 0.82
+  min_precision: 0.85
+  min_recall: 0.80
+
+  # Rollback if any metric below threshold
+  auto_rollback: true
+
+deployment:
+  strategy: blue-green
+  # Max wait time for Green job completion
+  timeout_minutes: 15
+  # Polling interval for job status
+  poll_interval_seconds: 30
+
+notifications:
+  slack_channel: "#o2-platform-alerts"
+  on_success: true
+  on_failure: true
+
+tags:
+  project: o2-platform
+  use_case: "10-coinbase-o2"
+  environment: poc

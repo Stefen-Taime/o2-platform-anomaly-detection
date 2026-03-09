@@ -1,0 +1,351 @@
+/**
+ * O2 Platform — Blue-Green ML Model Deployment Pipeline
+ *
+ * Adapted for Databricks CE constraints:
+ *   - No Databricks REST API (CE does not issue PATs)
+ *   - MLflow runs on EC2 (private IP within VPC)
+ *   - Blue-Green deployment targets the anomaly-detector on EKS
+ *
+ * Stages:
+ *   1. BUILD    — Package wheel + config → S3
+ *   2. DEPLOY GREEN — Upload model to S3, deploy Green replica on EKS
+ *   3. VALIDATE — Query MLflow EC2 metrics (AUC, Precision, Recall)
+ *   4. SWITCH   — Blue→Green if OK, Rollback if KO
+ */
+pipeline {
+    agent any
+
+    environment {
+        ARTIFACTS_BUCKET    = credentials('ARTIFACTS_BUCKET')
+        MLFLOW_TRACKING_URI = credentials('MLFLOW_TRACKING_URI')
+        SLACK_WEBHOOK       = credentials('SLACK_WEBHOOK')
+        AWS_REGION          = 'us-east-1'
+        MODEL_NAME          = 'o2-anomaly-xgboost'
+        EXPERIMENT_NAME     = '/O2-Anomaly-Detection'
+        EKS_CLUSTER         = 'o2-platform'
+        ECR_REPO            = credentials('ECR_REPO')
+        K8S_NAMESPACE       = 'kafka'
+        DEPLOYMENT_NAME     = 'o2-anomaly-detector'
+    }
+
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    stages {
+        // ================================================================
+        // STAGE 1: BUILD
+        // Package the model wheel + deploy config → S3 artifacts bucket
+        // ================================================================
+        stage('Build') {
+            steps {
+                script {
+                    env.VERSION = "v${BUILD_NUMBER}-${new Date().format('yyyyMMdd-HHmmss')}"
+                    env.WHEEL_PATH = "models/${MODEL_NAME}/${env.VERSION}"
+                }
+
+                echo "=== BUILD: Model package ${env.VERSION} ==="
+
+                // Build Python wheel from ml/ directory
+                sh '''
+                    cd ml
+                    python3.11 -m build --wheel --outdir dist/
+                '''
+
+                // Generate deployment config
+                writeFile file: 'ml/dist/deploy-config.yaml', text: """
+model_name: ${MODEL_NAME}
+version: ${env.VERSION}
+build_number: ${BUILD_NUMBER}
+timestamp: ${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'")}
+mlflow_experiment: ${EXPERIMENT_NAME}
+thresholds:
+  min_auc: 0.82
+  min_precision: 0.85
+  min_recall: 0.80
+"""
+
+                // Upload wheel + config to S3
+                sh """
+                    aws s3 cp ml/dist/ s3://${ARTIFACTS_BUCKET}/${env.WHEEL_PATH}/ \
+                        --recursive --region ${AWS_REGION}
+                    echo "Artifacts uploaded to s3://${ARTIFACTS_BUCKET}/${env.WHEEL_PATH}/"
+                """
+            }
+        }
+
+        // ================================================================
+        // STAGE 2: DEPLOY GREEN
+        // Download latest model from S3, deploy as Green on EKS
+        // The anomaly-detector gets a new env var MODEL_VERSION
+        // pointing to the new model artifact in S3
+        // ================================================================
+        stage('Deploy Green') {
+            steps {
+                echo "=== DEPLOY GREEN: ${env.VERSION} ==="
+
+                script {
+                    // Download the latest model from MLflow artifacts in S3
+                    // (trained by Databricks CE notebook 02_xgboost_training)
+                    writeFile file: '/tmp/mlflow_get_run.py', text: """import mlflow
+import json
+import os
+
+mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
+experiment = mlflow.get_experiment_by_name(os.environ['EXPERIMENT_NAME'])
+if not experiment:
+    print('NOT_FOUND')
+    exit(0)
+
+runs = mlflow.search_runs(
+    experiment_ids=[experiment.experiment_id],
+    order_by=['start_time DESC'],
+    max_results=1,
+    filter_string="attributes.status = 'FINISHED'"
+)
+
+if len(runs) == 0:
+    print('NOT_FOUND')
+else:
+    run_id = runs.iloc[0]['run_id']
+    print(run_id)
+"""
+                    def modelS3Key = sh(
+                        script: """
+                            MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI} EXPERIMENT_NAME=${EXPERIMENT_NAME} python3.11 /tmp/mlflow_get_run.py
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (modelS3Key == 'NOT_FOUND') {
+                        error("No completed MLflow run found in experiment ${EXPERIMENT_NAME}")
+                    }
+
+                    env.GREEN_RUN_ID = modelS3Key
+                    echo "Latest MLflow run: ${env.GREEN_RUN_ID}"
+
+                    // Copy model artifact from MLflow to the artifacts bucket
+                    // for the anomaly-detector to pick up
+                    sh """
+                        aws s3 cp \
+                            s3://${ARTIFACTS_BUCKET}/mlflow-artifacts/${env.GREEN_RUN_ID}/artifacts/model/xgboost_model.json \
+                            s3://${ARTIFACTS_BUCKET}/${env.WHEEL_PATH}/xgboost_model.json \
+                            --region ${AWS_REGION} || echo "Model copy from MLflow artifacts (may use local store)"
+                    """
+
+                    // Update EKS kubeconfig
+                    sh """
+                        aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION}
+                    """
+
+                    // Deploy Green: set MODEL_VERSION env on the anomaly-detector
+                    // This triggers a rolling update (Green deployment)
+                    sh """
+                        kubectl set env deployment/${DEPLOYMENT_NAME} \
+                            MODEL_VERSION=${env.VERSION} \
+                            MODEL_S3_PATH=s3://${ARTIFACTS_BUCKET}/${env.WHEEL_PATH}/xgboost_model.json \
+                            MODEL_RUN_ID=${env.GREEN_RUN_ID} \
+                            -n ${K8S_NAMESPACE}
+                    """
+
+                    // Wait for rollout to complete
+                    sh """
+                        kubectl rollout status deployment/${DEPLOYMENT_NAME} \
+                            -n ${K8S_NAMESPACE} --timeout=120s
+                    """
+
+                    echo "Green deployment rolled out successfully"
+                }
+            }
+        }
+
+        // ================================================================
+        // STAGE 3: VALIDATE
+        // Query MLflow EC2 for the latest run metrics
+        // Compare Green vs Blue (latest vs previous)
+        // ================================================================
+        stage('Validate') {
+            steps {
+                echo "=== VALIDATE: Checking MLflow metrics ==="
+
+                script {
+                    writeFile file: '/tmp/mlflow_validate.py', text: """import mlflow
+import json
+import sys
+import os
+
+mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
+experiment = mlflow.get_experiment_by_name(os.environ['EXPERIMENT_NAME'])
+
+if not experiment:
+    print(json.dumps({'error': 'experiment not found'}))
+    sys.exit(1)
+
+runs = mlflow.search_runs(
+    experiment_ids=[experiment.experiment_id],
+    order_by=['start_time DESC'],
+    max_results=2,
+    filter_string="attributes.status = 'FINISHED'"
+)
+
+if len(runs) == 0:
+    print(json.dumps({'error': 'no runs found'}))
+    sys.exit(1)
+
+if len(runs) < 2:
+    green = runs.iloc[0]
+    result = {
+        'green_auc': float(green.get('metrics.auc', 0)),
+        'blue_auc': 0,
+        'green_precision': float(green.get('metrics.precision', 0)),
+        'green_recall': float(green.get('metrics.recall', 0)),
+        'green_f1': float(green.get('metrics.f1', 0)),
+        'approved': True,
+        'reason': 'First deployment - auto-approved'
+    }
+    print(json.dumps(result))
+    sys.exit(0)
+
+green = runs.iloc[0]
+blue = runs.iloc[1]
+
+result = {
+    'green_auc': float(green.get('metrics.auc', 0)),
+    'blue_auc': float(blue.get('metrics.auc', 0)),
+    'green_precision': float(green.get('metrics.precision', 0)),
+    'green_recall': float(green.get('metrics.recall', 0)),
+    'green_f1': float(green.get('metrics.f1', 0)),
+    'approved': False,
+    'reason': ''
+}
+
+# PRD S5.3 - Validation rules
+ga = result['green_auc']
+ba = result['blue_auc']
+gp = result['green_precision']
+gr = result['green_recall']
+if ga < 0.82:
+    result['reason'] = 'AUC %.4f < 0.82 threshold' % ga
+elif ga < ba * 0.98:
+    result['reason'] = 'AUC regression: %.4f vs %.4f (>2%% drop)' % (ga, ba)
+elif gp < 0.85:
+    result['reason'] = 'Precision %.4f < 0.85 threshold' % gp
+elif gr < 0.80:
+    result['reason'] = 'Recall %.4f < 0.80 threshold' % gr
+else:
+    result['approved'] = True
+    result['reason'] = 'All thresholds met'
+
+print(json.dumps(result))
+"""
+                    def metricsOutput = sh(
+                        script: """
+                            MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI} EXPERIMENT_NAME=${EXPERIMENT_NAME} python3.11 /tmp/mlflow_validate.py
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def metrics = readJSON(text: metricsOutput)
+
+                    env.GREEN_AUC = metrics.green_auc?.toString() ?: 'N/A'
+                    env.BLUE_AUC = metrics.blue_auc?.toString() ?: 'N/A'
+                    env.GREEN_F1 = metrics.green_f1?.toString() ?: 'N/A'
+                    env.VALIDATION_APPROVED = metrics.approved.toString()
+                    env.VALIDATION_REASON = metrics.reason
+
+                    echo "Green AUC:       ${env.GREEN_AUC}"
+                    echo "Blue AUC:        ${env.BLUE_AUC}"
+                    echo "Green F1:        ${env.GREEN_F1}"
+                    echo "Approved:        ${env.VALIDATION_APPROVED}"
+                    echo "Reason:          ${env.VALIDATION_REASON}"
+
+                    if (env.VALIDATION_APPROVED != 'true') {
+                        error("Validation FAILED: ${env.VALIDATION_REASON}")
+                    }
+                }
+            }
+        }
+
+        // ================================================================
+        // STAGE 4: SWITCH BLUE -> GREEN
+        // Label the new deployment as production (Blue)
+        // ================================================================
+        stage('Switch Blue-Green') {
+            steps {
+                echo "=== SWITCH: Blue -> Green ==="
+
+                script {
+                    // Annotate the deployment with the production label
+                    sh """
+                        kubectl annotate deployment/${DEPLOYMENT_NAME} \
+                            o2-platform/model-version=${env.VERSION} \
+                            o2-platform/deployment-color=blue \
+                            o2-platform/mlflow-run-id=${env.GREEN_RUN_ID} \
+                            o2-platform/switched-at="\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                            --overwrite \
+                            -n ${K8S_NAMESPACE}
+                    """
+
+                    // Record the deployment in S3 as a manifest
+                    writeFile file: '/tmp/deployment-manifest.json', text: """
+{
+    "version": "${env.VERSION}",
+    "mlflow_run_id": "${env.GREEN_RUN_ID}",
+    "green_auc": ${env.GREEN_AUC},
+    "blue_auc": ${env.BLUE_AUC},
+    "green_f1": ${env.GREEN_F1},
+    "validation_reason": "${env.VALIDATION_REASON}",
+    "deployed_at": "${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'")}"
+}
+"""
+                    sh """
+                        aws s3 cp /tmp/deployment-manifest.json \
+                            s3://${ARTIFACTS_BUCKET}/${env.WHEEL_PATH}/deployment-manifest.json \
+                            --region ${AWS_REGION}
+                        aws s3 cp /tmp/deployment-manifest.json \
+                            s3://${ARTIFACTS_BUCKET}/models/${MODEL_NAME}/latest/deployment-manifest.json \
+                            --region ${AWS_REGION}
+                    """
+
+                    echo "Switch complete. ${env.VERSION} is now Blue (production)."
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline SUCCESS: ${env.VERSION} deployed to production"
+            sh """
+                curl -s -X POST "${SLACK_WEBHOOK}" \
+                    -H 'Content-type: application/json' \
+                    -d '{
+                        "text": ":white_check_mark: *O2 Model Deployed*\\nVersion: ${env.VERSION}\\nAUC: ${env.GREEN_AUC} (was ${env.BLUE_AUC})\\nF1: ${env.GREEN_F1}\\nStatus: Blue-Green switch complete"
+                    }' || true
+            """
+        }
+        failure {
+            echo "Pipeline FAILED: Rolling back"
+            script {
+                // Rollback: undo the rolling update
+                try {
+                    sh """
+                        aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION} 2>/dev/null || true
+                        kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} || true
+                    """
+                } catch (Exception e) {
+                    echo "Rollback warning: ${e.message}"
+                }
+            }
+            sh """
+                curl -s -X POST "${SLACK_WEBHOOK}" \
+                    -H 'Content-type: application/json' \
+                    -d '{
+                        "text": ":x: *O2 Model Deployment FAILED*\\nVersion: ${env.VERSION}\\nReason: ${env.VALIDATION_REASON ?: 'Build/Deploy error'}\\nRolled back to previous Blue version"
+                    }' || true
+            """
+        }
+    }
+}

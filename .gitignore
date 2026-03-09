@@ -1,0 +1,58 @@
+# =============================================================================
+# O2 Platform — .gitignore
+# =============================================================================
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/tfplan
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/crash.log
+
+# SSH keys
+terraform/o2-key
+terraform/o2-key.pub
+*.pem
+*.key
+
+# Lambda zip
+terraform/lambda/slack_notifier.zip
+*.zip
+
+# Secrets / env
+.env
+.env.*
+*.secret
+credentials.json
+
+# Claude settings (may contain credentials)
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+generator/o2-generator
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Java
+kafka-streams-app/target/

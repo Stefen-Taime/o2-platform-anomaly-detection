@@ -1,0 +1,74 @@
+# =============================================================================
+# O2 Platform — Kafka Cluster (Strimzi 0.46+ / KRaft mode)
+# =============================================================================
+# KafkaNodePool for combined controller+broker nodes (POC single-pool)
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: o2-pool
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: o2-kafka
+spec:
+  replicas: 1
+  roles:
+    - controller
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 10Gi
+        deleteClaim: true
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 250m
+    limits:
+      memory: 1Gi
+      cpu: 500m
+---
+# Kafka cluster resource (KRaft — no ZooKeeper)
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: o2-kafka
+  namespace: kafka
+  annotations:
+    strimzi.io/kraft: enabled
+    strimzi.io/node-pools: enabled
+spec:
+  kafka:
+    version: 4.2.0
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: external
+        port: 9094
+        type: nodeport
+        tls: false
+        configuration:
+          bootstrap:
+            nodePort: 31094
+          brokers:
+            - broker: 0
+              advertisedHost: localhost
+              advertisedPort: 31095
+              nodePort: 31095
+    config:
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1
+      # Logical Clocks — preserve event_time from producer
+      log.message.timestamp.type: CreateTime
+      # Retention 24h for POC
+      log.retention.hours: 24
+      log.retention.bytes: 1073741824
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}

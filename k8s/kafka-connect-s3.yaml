@@ -1,0 +1,72 @@
+# =============================================================================
+# O2 Platform — Kafka Connect S3 Sink (Strimzi 0.51 / Kafka 4.2.0)
+# =============================================================================
+# Writes all topics to S3 as JSON for audit trail + Snowflake ingestion
+# =============================================================================
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnect
+metadata:
+  name: o2-connect
+  namespace: kafka
+  annotations:
+    strimzi.io/use-connector-resources: "true"
+spec:
+  version: 4.2.0
+  replicas: 1
+  bootstrapServers: o2-kafka-kafka-bootstrap:9092
+  groupId: o2-connect-cluster
+  offsetStorageTopic: connect-offsets
+  configStorageTopic: connect-configs
+  statusStorageTopic: connect-status
+  image: REPLACE_WITH_ECR_URL:v2
+  config:
+    offset.storage.replication.factor: 1
+    config.storage.replication.factor: 1
+    status.storage.replication.factor: 1
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter.schemas.enable: false
+    plugin.path: /opt/kafka/plugins
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 250m
+    limits:
+      memory: 1Gi
+      cpu: 500m
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnector
+metadata:
+  name: s3-sink-connector
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: o2-connect
+spec:
+  class: io.confluent.connect.s3.S3SinkConnector
+  tasksMax: 1
+  config:
+    # Topics to sink
+    topics: transactions,claims,logins,transfers,anomalies
+    # S3 configuration
+    s3.bucket.name: REPLACE_WITH_AUDIT_BUCKET
+    s3.region: us-east-1
+    # Flush every 100 records or every 60 seconds (POC — faster feedback)
+    flush.size: 100
+    rotate.interval.ms: 60000
+    # Storage
+    storage.class: io.confluent.connect.s3.storage.S3Storage
+    # JSON format (no schema registry needed)
+    format.class: io.confluent.connect.s3.format.json.JsonFormat
+    # Time-based partitioning (for Snowflake/analytics)
+    partitioner.class: io.confluent.connect.storage.partitioner.TimeBasedPartitioner
+    partition.duration.ms: 3600000
+    path.format: "'year'=YYYY/'month'=MM/'day'=dd/'hour'=HH"
+    locale: en-US
+    timezone: UTC
+    # Schema
+    schema.compatibility: NONE
+    # Converters
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter.schemas.enable: false
