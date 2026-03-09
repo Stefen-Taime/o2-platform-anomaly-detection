@@ -246,3 +246,4 @@ cd terraform && terraform destroy -auto-approve
 | Successful Jenkins builds | Build #7, #8 (full Blue-Green) |
 | Production version | v8-20260309-211240 |
 | Detection rules | 7 (HIGH_VELOCITY, AMOUNT_OUT_OF_PROFILE, NEW_ACCOUNT_HIGH_AMOUNT, EARLY_CLAIM, MULTIPLE_CLAIMS, UNKNOWN_DEVICE, HIGH_VALUE_TRANSFER, TRANSFER_BURST) |
+# o2-platform-anomaly-detection
