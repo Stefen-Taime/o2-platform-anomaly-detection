@@ -5,6 +5,41 @@ Inspired by Coinbase's O2 architecture: **Logic-on-Write**, **Logical Clocks**, 
 
 Targets: BNC, Intact Financial Data Lab, CDPQ.
 
+## Architecture Overview
+
+```
+[Real-time flow]
+Go Generator (Mac) --> Kafka 4.2.0 (EKS/Strimzi/KRaft) --> Kafka Streams --> DynamoDB + SNS --> Slack
+       ~100 evt/s         4 topics (3p each)            Enrich + Score (7 rules)
+                                                              |
+                                                        [Logic-on-Write]
+                                                        [Logical Clocks]
+                                                     [In-Memory Processing]
+
+[Audit trail flow]
+Kafka --> S3 Sink Connector (JSON) --> S3 --> Snowpipe (SQS) --> Snowflake (RAW + MART)
+
+[ML flow]
+S3 features --> Databricks CE (XGBoost) --> MLflow (EC2) --> Jenkins Blue-Green --> EKS
+```
+
+### Tech Stack
+
+| Layer | Technology |
+|-------|------------|
+| Cloud | AWS (us-east-1) |
+| IaC | Terraform (7 modules) |
+| Streaming | Kafka 4.2.0 (Strimzi/KRaft) on EKS |
+| Stream Processing | Kafka Streams (Java) |
+| Event Generator | Go (franz-go/kgo, 4 goroutines) |
+| ML Training | Databricks CE + XGBoost 2.x |
+| Feature Store | DynamoDB (on-demand, < 10ms) |
+| Experiment Tracking | MLflow 2.14.0 on EC2 |
+| CI/CD | Jenkins Blue-Green (4 stages) |
+| Audit Trail | S3 JSON via Kafka Connect |
+| Data Warehouse | Snowflake (Snowpipe auto-ingest) |
+| Alerting | SNS + Lambda + Slack |
+
 ## Prerequisites
 
 ### Local Tools
@@ -246,4 +281,3 @@ cd terraform && terraform destroy -auto-approve
 | Successful Jenkins builds | Build #7, #8 (full Blue-Green) |
 | Production version | v8-20260309-211240 |
 | Detection rules | 7 (HIGH_VELOCITY, AMOUNT_OUT_OF_PROFILE, NEW_ACCOUNT_HIGH_AMOUNT, EARLY_CLAIM, MULTIPLE_CLAIMS, UNKNOWN_DEVICE, HIGH_VALUE_TRANSFER, TRANSFER_BURST) |
-# o2-platform-anomaly-detection
